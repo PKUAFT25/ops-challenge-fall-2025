@@ -1,0 +1,97 @@
+# .github/workflows/commenter.yml
+name: Comment Grader Result
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  actions: read         # 读取另一工作流的产物
+  issues: write         # 用 Issues API 发/改评论
+  pull-requests: write  # 备用
+
+jobs:
+  comment:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Wait for grade run & resolve run_id (poll up to ~5 min)
+        id: find
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const pr = context.payload.pull_request;
+            const headSha = pr.head.sha;
+
+            // 找到名为 "Grade Submission" 的工作流
+            const wfs = await github.rest.actions.listRepoWorkflows({ owner, repo });
+            const wf = wfs.data.workflows.find(w => w.name === "Grade Submission");
+            if (!wf) {
+              core.setFailed('Workflow "Grade Submission" not found');
+              return;
+            }
+
+            // 轮询等待评分 run 完成
+            const deadline = Date.now() + 5 * 60 * 1000; // 5 分钟
+            let runId = null;
+            while (Date.now() < deadline) {
+              const runs = await github.rest.actions.listWorkflowRuns({
+                owner, repo, workflow_id: wf.id, event: "pull_request", per_page: 50
+              });
+              const run = runs.data.workflow_runs.find(
+                r => r.head_sha === headSha && r.status === "completed"
+              );
+              if (run) { runId = run.id; break; }
+              await new Promise(r => setTimeout(r, 10000)); // 10s
+            }
+            if (!runId) core.setFailed('No completed grade run found for this PR head sha');
+            core.setOutput("run_id", String(runId));
+
+      - name: Download grader artifact
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.find.outputs.run_id }}
+          name: grader-result
+          path: ./artifacts
+
+      - name: Build comment body
+        id: body
+        run: |
+          python - <<'PY'
+          import json, pathlib, os, sys
+          p = pathlib.Path("artifacts/result.json")
+          if not p.exists():
+              open(os.environ['GITHUB_OUTPUT'], 'a').write("BODY=Grader result artifact not found\n")
+              sys.exit(0)
+          r = json.load(open(p))
+          status = r.get("status","UNKNOWN")
+          elapsed = r.get("elapsed_seconds")
+          max_diff = r.get("max_diff")
+          emo = {"PASS":"✅","WRONG_ANSWER":"❌","TIMEOUT":"⏱️","RUNTIME_ERROR":"💥","VERIFY_ERROR":"⚠️","GRADER_ERROR":"🔧"}.get(status,"❓")
+          lines = [f"## {emo} Grader Result", "", f"**Status:** `{status}`"]
+          if isinstance(elapsed,(int,float)): lines.append(f"**Elapsed Time:** {elapsed:.3f} seconds")
+          if max_diff is not None: lines.append(f"**Max Difference:** {max_diff}")
+          body = "\\n".join(lines) + "\\n"
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f:
+              f.write("BODY<<EOF\n"); f.write(body); f.write("\nEOF\n")
+          PY
+
+      - name: Upsert PR comment
+        uses: actions/github-script@v7
+        env:
+          BODY: ${{ steps.body.outputs.BODY }}
+        with:
+          script: |
+            const header = "<!-- OPS-CHALLENGE-GRADER -->";
+            const body = `${header}\n\n${process.env.BODY || "Grader result not found"}`;
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const { data: comments } = await github.rest.issues.listComments({ owner, repo, issue_number });
+            const bot = comments.find(c => c.body && c.body.startsWith(header));
+            if (bot) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: bot.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }

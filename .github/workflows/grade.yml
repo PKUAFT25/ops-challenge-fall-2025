@@ -289,37 +289,12 @@ jobs:
               f.write("\n".join(lines))
               f.write("\n")
           PY
-
-      - name: Comment on PR (read from file to avoid template breaks)
+          
+      - name: Upload grader result
         if: always()
-        uses: actions/github-script@v7
+        uses: actions/upload-artifact@v4
         with:
-          script: |
-            const fs = require('fs');
-            const header = "<!-- OPS-CHALLENGE-GRADER -->";
-            let bodyText = "Grader Result\n`GRADER_ERROR`";
-            try {
-              bodyText = fs.readFileSync('pr_comment.txt','utf8');
-            } catch (e) {}
-            const body = `${header}\n\n${bodyText}`;
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-            });
-            const bot = comments.find(c => c.body && c.body.startsWith(header));
-            if (bot) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: bot.id,
-                body
-              });
-            } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body
-              });
-            }
+          name: grader-result
+          path: result.json
+          if-no-files-found: warn
+          retention-days: 7
