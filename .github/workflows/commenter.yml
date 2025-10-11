@@ -80,12 +80,25 @@ jobs:
 
       - name: Upsert PR comment
         uses: actions/github-script@v7
-        env:
-          BODY: ${{ steps.body.outputs.BODY }}
         with:
           script: |
+            const fs = require('fs');
             const header = "<!-- OPS-CHALLENGE-GRADER -->";
-            const body = `${header}\n\n${process.env.BODY || "Grader result not found"}`;
+            let bodyText = "Grader result not found";
+            try {
+              bodyText = fs.readFileSync('artifacts/pr_comment.txt','utf8'); // 直接读文件，是真换行
+            } catch (e) {
+              // 兜底：从 result.json 拼一个简版
+              try {
+                const r = JSON.parse(fs.readFileSync('artifacts/result.json','utf8'));
+                const emo = {PASS:"✅",WRONG_ANSWER:"❌",TIMEOUT:"⏱️",RUNTIME_ERROR:"💥",VERIFY_ERROR:"⚠️",GRADER_ERROR:"🔧"}[r.status] || "❓";
+                bodyText = `## ${emo} Grader Result
+      
+                **Status:** \`${r.status}\`
+                ${r.elapsed_seconds!=null?`**Elapsed Time:** ${r.elapsed_seconds.toFixed(3)} seconds\n`:``}${r.max_diff!=null?`**Max Difference:** ${r.max_diff}\n`:``}`;
+              } catch {}
+            }
+            const body = `${header}\n\n${bodyText}`;
             const { owner, repo } = context.repo;
             const issue_number = context.payload.pull_request.number;
             const { data: comments } = await github.rest.issues.listComments({ owner, repo, issue_number });
@@ -95,3 +108,4 @@ jobs:
             } else {
               await github.rest.issues.createComment({ owner, repo, issue_number, body });
             }
+
