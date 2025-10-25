@@ -1,27 +1,49 @@
-import pandas as pd
+import polars as pl
 import numpy as np
+from numba import jit
 
+
+@jit(nopython=True, fastmath=True, nogil=True)
+def _rolling_rank_numba(values, window, out):
+    n = len(values)
+    for i in range(n):
+        start_idx = max(0, i - window + 1)
+        end_idx = i + 1
+        window_size = end_idx - start_idx
+        if window_size == 0:
+            out[i] = np.nan
+        else:
+            current_val = values[i]
+            rank_sum = 0.0
+            for j in range(start_idx, end_idx):
+                if values[j] <= current_val:
+                    rank_sum += 1.0
+            out[i] = rank_sum / window_size
+    return out
+
+
+class ops:
+    @staticmethod
+    def rolling_rank(col_or_expr, window: int) -> pl.Expr:
+        def rolling_rank(s: pl.Series) -> pl.Series:
+            values = s.to_numpy()
+            result = np.empty(values.shape[0], dtype=np.float32)
+            _rolling_rank_numba(values, window, result)
+            return result
+
+        if isinstance(col_or_expr, str):
+            expr = pl.col(col_or_expr)
+        else:
+            expr = col_or_expr
+        return expr.map_batches(rolling_rank)
+    
 
 def ops_rolling_rank(input_path: str, window: int = 20) -> np.ndarray:
-    df = pd.read_parquet(input_path)
-
-    def rolling_percentile_rank(series):
-        def rank_window(window_data):
-            if len(window_data) == 0:
-                return np.nan
-            current_val = window_data.iloc[-1]
-            rank_sum = (window_data <= current_val).sum()
-            return rank_sum / len(window_data)
-
-        return series.rolling(window=window, min_periods=1).apply(
-            rank_window, raw=False
-        )
-
-    ranks = df.groupby('symbol', group_keys=False)['Close'].apply(
-        rolling_percentile_rank
-    )
-
-    res = ranks.values.astype(np.float32)
-    return res[:, None] # must be [N, 1]
-
-
+    res = (
+        pl.scan_parquet(input_path)
+        .with_columns(pl.col("Close").cast(pl.Float32))
+        .select(
+            ops.rolling_rank("Close", window).over("symbol")
+        )
+    ).collect()
+    return res.to_numpy()
