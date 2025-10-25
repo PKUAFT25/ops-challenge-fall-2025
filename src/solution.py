@@ -1,84 +1,112 @@
 import numpy as np
-import pandas as pd
-from numba import njit
+import polars as pl
+from typing import Union
 
-#(cache=True, fastmath=True)
-@njit(cache=True, fastmath=True)
-def _rolling_percentile_rank(values: np.ndarray, window: int) -> np.ndarray:
+# --- Polars 算子包裝類 ---
+class ops:
     """
-    Compute the rolling percentile rank of the last observation in each window.
-
-    Parameters
-    ----------
-    values : np.ndarray
-        Input series for a single symbol.
-    window : int
-        Rolling window size.
-
-    Returns
-    -------
-    np.ndarray
-        Rolling percentile ranks for `values`.
+    為 Polars DataFrame 封裝原生高性能算子的類。
     """
-    length = values.shape[0]
-    out = np.empty(length, dtype=np.float32)
+    @staticmethod
+    def rolling_rank(
+        col_or_expr: Union[str, pl.Expr],
+        window: int
+    ) -> pl.Expr:
+        """
+        創建 Polars 表達式，使用原生函數計算滾動百分位排名。
+        此實現旨在匹配原始 Numba 函數的行為：
+        rank = (count <= current) / window_slice_length
 
-    for idx in range(length):
-        current = values[idx]
-        if np.isnan(current):
-            out[idx] = np.nan
-            continue
-
-        start = idx - window + 1
-        if start < 0:
-            start = 0
-
-        count = 0
-        total = 0
-        for j in range(start, idx + 1):
-            val = values[j]
-            if np.isnan(val):
-                continue
-            total += 1
-            if val <= current:
-                count += 1
-
-        if total == 0:
-            out[idx] = np.nan
+        - 分子: 使用 rolling_rank(method='max') 計算 count <= current。
+        - 分母: 使用 pl.min_horizontal(pl.arange(0, pl.len()) + 1, window) 計算窗口切片總長度。
+        - 處理 NaN: 如果當前值為 NaN，結果強制為 NaN。
+        """
+        if isinstance(col_or_expr, str):
+            expr = pl.col(col_or_expr)
         else:
-            out[idx] = count / total
+            expr = col_or_expr
 
-    return out
+        # 1. 計算窗口切片的實際總長度 (分母)
+        #    等同於 Numba 中的 end_idx - start_idx
+        denominator_expr = pl.min_horizontal(
+            pl.arange(0, pl.len()) + 1, # row_index + 1
+            pl.lit(window)              # window_size
+        ).cast(pl.Float32)
 
+        # 2. 計算滾動排名 (分子)
+        #    method='max' 匹配 Numba 的 "count <= current" 邏輯
+        #    使用 min_samples=1 保持滾動的起始行為
+        rank_expr = expr.rolling_rank(
+            window_size=window,
+            method='max',
+            min_samples=1 # 從第一個有效樣本開始計算
+        )
 
-def ops_rolling_rank(input_path: str, window: int = 20) -> np.ndarray:
-    if window <= 0:
-        raise ValueError("window must be a positive integer")
+        # 3. 計算基礎的百分位排名
+        #    rank / 窗口總長度
+        base_rank_pct = (rank_expr.cast(pl.Float32) / denominator_expr).cast(pl.Float32)
 
-    df = pd.read_parquet(input_path, columns=["symbol", "Close"])
+        # 4. 處理當前值為 NaN 的情況
+        #    如果 expr 本身是 NaN，則結果強制為 NaN
+        result_expr = pl.when(expr.is_nan()).then(pl.lit(np.nan)).otherwise(base_rank_pct)
 
-    close = df["Close"].to_numpy().astype(np.float64, copy=False)
-    codes, _ = pd.factorize(df["symbol"], sort=False)
+        return result_expr
 
-    order = np.argsort(codes, kind="mergesort")
-    sorted_codes = codes[order]
-    sorted_close = close[order]
+# --- 完整的執行函數（示範） ---
+def ops_rolling_rank(
+    input_path: str,
+    window: int = 20
+) -> np.ndarray:
+    """
+    完整演示：讀取 Parquet 文件，對每個 'symbol' 分組計算滾動排名。
+    使用 Polars 原生函數實現，其行為與原始 Numba 函數對齊。
 
-    sorted_result = np.empty(sorted_close.shape[0], dtype=np.float32)
+    Args:
+        input_path: Parquet 文件路徑。
+        window: 滾動窗口大小。
 
-    start = 0
-    total = sorted_close.shape[0]
-    while start < total:
-        code = sorted_codes[start]
-        end = start + 1
-        while end < total and sorted_codes[end] == code:
-            end += 1
+    Returns:
+        計算出的滾動排名結果（[N, 1] 的 NumPy 數組）。
+    """
+    try:
+        # 1. 讀取 Parquet 文件
+        df = pl.read_parquet(input_path)
+    except FileNotFoundError:
+        print(f"錯誤：未找到文件 {input_path}。請確保路徑正確或使用 pl.DataFrame(...) 創建一個示例數據。")
+        # 假設我們無法讀取文件，返回空數組
+        return np.array([[]], dtype=np.float32)
 
-        segment = np.ascontiguousarray(sorted_close[start:end])
-        sorted_result[start:end] = _rolling_percentile_rank(segment, window)
-        start = end
+    # 2. 使用 Polars 表達式進行分組和計算
+    #    .over("symbol") 會對每個 'symbol' 組獨立執行滾動排名操作
+    res = df.select(
+        # 調用 ops 類中的 rolling_rank 靜態方法
+        ops.rolling_rank("Close", window).over("symbol").alias("RollingRank")
+    )
 
-    result = np.empty_like(sorted_result)
-    result[order] = sorted_result
+    # 3. 返回結果的 NumPy 數組
+    #    [:, None] 用於確保輸出是 [N, 1] 形狀的二維數組
+    return res["RollingRank"].to_numpy().astype(np.float32)[:, None]
 
-    return result.reshape(-1, 1)
+# --- 示範如何調用 (需要您提供一個 parquet 文件路徑) ---
+# if __name__ == "__main__":
+#     # 替換為您的 Parquet 文件路徑
+#     parquet_file = "your_data.parquet"
+#
+#     # 創建示例 Parquet 文件 (如果需要)
+#     try:
+#         pl.read_parquet(parquet_file)
+#     except FileNotFoundError:
+#         print(f"創建示例文件: {parquet_file}")
+#         example_df = pl.DataFrame({
+#             "symbol": ["A"] * 50 + ["B"] * 50,
+#             "Close": np.random.rand(100) * 100
+#         })
+#         example_df.write_parquet(parquet_file)
+#
+#     # 執行計算
+#     rolling_ranks = ops_rolling_rank(parquet_file, window=10)
+#     print("\n計算完成，結果數組形狀:", rolling_ranks.shape)
+#     # print("部分結果:")
+#     # print(rolling_ranks[:5])
+#     # print("...")
+#     # print(rolling_ranks[50:55])
