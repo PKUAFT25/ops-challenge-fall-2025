@@ -24,7 +24,12 @@ def rolling_rank_numba(values, window):
 
 
 def ops_rolling_rank(input_path: str, window: int = 20) -> np.ndarray:
-    df = pd.read_parquet(input_path, columns=['symbol', 'Close'])
+    df = pd.read_parquet(
+        input_path, 
+        columns=['symbol', 'Close'],
+        engine='pyarrow',
+        use_threads=True
+    )
     
     if df['Close'].dtype == np.float64:
         df['Close'] = df['Close'].astype(np.float32)
